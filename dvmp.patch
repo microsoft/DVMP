@@ -1,0 +1,526 @@
+diff --git a/fairseq/binarizer.py b/fairseq/binarizer.py
+index 18ae67bf..3d697481 100644
+--- a/fairseq/binarizer.py
++++ b/fairseq/binarizer.py
+@@ -9,7 +9,9 @@ from collections import Counter
+ import torch
+ from fairseq.file_io import PathManager
+ from fairseq.tokenizer import tokenize_line
+-from typing import List, Dict
++from typing import List, Dict, Callable
++from molecule.detokenize_re import detokenize as detokenize_mol
++from molecule.mol import smiles2graph
+ 
+ 
+ def safe_readline(f):
+@@ -112,3 +114,31 @@ class Binarizer:
+                 safe_readline(f)
+                 offsets[i] = f.tell()
+             return offsets
++
++    @staticmethod
++    def binarize_molecule(
++            filename,
++            consumer: Callable,
++            detokenize=detokenize_mol,
++            offset=0,
++            end=-1,
++    ) -> Dict[str, int]:
++        ngraph, nnode = 0, 0
++
++        with open(PathManager.get_local_path(filename), 'r', encoding='utf8') as f:
++            f.seek(offset)
++            line = safe_readline(f)
++            while line:
++                if end > 0 and f.tell() > end and f.tell() < end + 2 ** 32:
++                    break
++                SMILES = detokenize(line.strip())
++                graph = smiles2graph(SMILES)
++                ngraph += 1
++                nnode += graph['num_nodes']
++                consumer(graph)
++                line = f.readline()
++        return {
++            "ngraph": ngraph,
++            "nnode": nnode
++        }
++
+diff --git a/fairseq/data/__init__.py b/fairseq/data/__init__.py
+index 9b308139..72c63ad0 100644
+--- a/fairseq/data/__init__.py
++++ b/fairseq/data/__init__.py
+@@ -13,6 +13,7 @@ from .base_wrapper_dataset import BaseWrapperDataset
+ from .add_target_dataset import AddTargetDataset
+ from .append_token_dataset import AppendTokenDataset
+ from .audio.raw_audio_dataset import FileAudioDataset
++from .molecule import indexed_dataset as mol_indexed_dataset
+ from .backtranslation_dataset import BacktranslationDataset
+ from .bucket_pad_length_dataset import BucketPadLengthDataset
+ from .colorize_dataset import ColorizeDataset
+diff --git a/fairseq/data/language_pair_dataset.py b/fairseq/data/language_pair_dataset.py
+index ff3e14bf..a4a4d72a 100644
+--- a/fairseq/data/language_pair_dataset.py
++++ b/fairseq/data/language_pair_dataset.py
+@@ -74,9 +74,10 @@ def collate(
+     src_lengths = torch.LongTensor(
+         [s["source"].ne(pad_idx).long().sum() for s in samples]
+     )
+-    src_lengths, sort_order = src_lengths.sort(descending=True)
+-    id = id.index_select(0, sort_order)
+-    src_tokens = src_tokens.index_select(0, sort_order)
++    # src_lengths, sort_order = src_lengths.sort(descending=True)
++    sort_order = None 
++    # id = id.index_select(0, sort_order)
++    # src_tokens = src_tokens.index_select(0, sort_order)
+ 
+     prev_output_tokens = None
+     target = None
+@@ -88,10 +89,10 @@ def collate(
+             if pad_to_length is not None
+             else None,
+         )
+-        target = target.index_select(0, sort_order)
++        # target = target.index_select(0, sort_order)
+         tgt_lengths = torch.LongTensor(
+             [s["target"].ne(pad_idx).long().sum() for s in samples]
+-        ).index_select(0, sort_order)
++        )
+         ntokens = tgt_lengths.sum().item()
+ 
+         if samples[0].get("prev_output_tokens", None) is not None:
+@@ -118,9 +119,7 @@ def collate(
+         "target": target,
+     }
+     if prev_output_tokens is not None:
+-        batch["net_input"]["prev_output_tokens"] = prev_output_tokens.index_select(
+-            0, sort_order
+-        )
++        batch["net_input"]["prev_output_tokens"] = prev_output_tokens
+ 
+     if samples[0].get("alignment", None) is not None:
+         bsz, tgt_sz = batch["target"].shape
+diff --git a/fairseq/data/nested_dictionary_dataset.py b/fairseq/data/nested_dictionary_dataset.py
+index 52e74abd..5d1a96ef 100644
+--- a/fairseq/data/nested_dictionary_dataset.py
++++ b/fairseq/data/nested_dictionary_dataset.py
+@@ -7,7 +7,7 @@ from collections import OrderedDict
+ 
+ import torch
+ from torch.utils.data.dataloader import default_collate
+-
++from fairseq.data.molecule.molecule import mol_collater
+ from . import FairseqDataset
+ 
+ 
+@@ -87,6 +87,8 @@ class NestedDictionaryDataset(FairseqDataset):
+         for k, ds in self.defn.items():
+             try:
+                 sample[k] = ds.collater([s[k] for s in samples])
++            except TypeError:
++                sample[k] = mol_collater([s[k] for s in samples])
+             except NotImplementedError:
+                 sample[k] = default_collate([s[k] for s in samples])
+         return _unflatten(sample)
+diff --git a/fairseq/data/numel_dataset.py b/fairseq/data/numel_dataset.py
+index ac86dfd2..a22962bc 100644
+--- a/fairseq/data/numel_dataset.py
++++ b/fairseq/data/numel_dataset.py
+@@ -5,7 +5,7 @@
+ 
+ import numpy as np
+ import torch
+-
++from torch_geometric.data import Data
+ from . import BaseWrapperDataset
+ 
+ 
+@@ -18,6 +18,8 @@ class NumelDataset(BaseWrapperDataset):
+         item = self.dataset[index]
+         if torch.is_tensor(item):
+             return torch.numel(item)
++        elif isinstance(item, Data):
++            return item.num_nodes
+         else:
+             return np.size(item)
+ 
+diff --git a/fairseq/model_parallel/megatron b/fairseq/model_parallel/megatron
+deleted file mode 160000
+index adb23324..00000000
+--- a/fairseq/model_parallel/megatron
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit adb23324c222aad0aad89308e70302d996a5eaeb
+diff --git a/fairseq/modules/multihead_attention.py b/fairseq/modules/multihead_attention.py
+index d84c7e07..ba40ebea 100644
+--- a/fairseq/modules/multihead_attention.py
++++ b/fairseq/modules/multihead_attention.py
+@@ -19,7 +19,6 @@ from torch.nn import Parameter
+ @with_incremental_state
+ class MultiheadAttention(nn.Module):
+     """Multi-headed attention.
+-
+     See "Attention Is All You Need" for more details.
+     """
+ 
+@@ -45,9 +44,7 @@ class MultiheadAttention(nn.Module):
+         self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
+ 
+         self.num_heads = num_heads
+-        self.dropout_module = FairseqDropout(
+-            dropout, module_name=self.__class__.__name__
+-        )
++        self.dropout_module = FairseqDropout(dropout, module_name=self.__class__.__name__)
+ 
+         self.head_dim = embed_dim // num_heads
+         assert (
+@@ -125,7 +122,6 @@ class MultiheadAttention(nn.Module):
+         need_head_weights: bool = False,
+     ) -> Tuple[Tensor, Optional[Tensor]]:
+         """Input shape: Time x Batch x Channel
+-
+         Args:
+             key_padding_mask (ByteTensor, optional): mask to exclude
+                 keys that are pads, of shape `(batch, src_len)`, where
+@@ -151,12 +147,11 @@ class MultiheadAttention(nn.Module):
+         assert embed_dim == self.embed_dim
+         assert list(query.size()) == [tgt_len, bsz, embed_dim]
+         if key is not None:
+-            src_len, key_bsz, key_embed_dim = key.size()
++            src_len, key_bsz, _ = key.size()
+             if not torch.jit.is_scripting():
+-                assert (key_bsz, key_embed_dim) == (bsz, embed_dim)
++                assert key_bsz == bsz
+                 assert value is not None
+-                assert (src_len, bsz, embed_dim) == value.shape
+-
++                assert src_len, bsz == value.shape[:2]
+ 
+         if (
+             not self.onnx_trace
+@@ -229,35 +224,18 @@ class MultiheadAttention(nn.Module):
+             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
+             v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
+             if attn_mask is not None:
+-                attn_mask = torch.cat(
+-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
+-                )
++                attn_mask = torch.cat([attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1)
+             if key_padding_mask is not None:
+                 key_padding_mask = torch.cat(
+-                    [
+-                        key_padding_mask,
+-                        key_padding_mask.new_zeros(key_padding_mask.size(0), 1),
+-                    ],
++                    [key_padding_mask, key_padding_mask.new_zeros(key_padding_mask.size(0), 1),],
+                     dim=1,
+                 )
+ 
+-        q = (
+-            q.contiguous()
+-            .view(tgt_len, bsz * self.num_heads, self.head_dim)
+-            .transpose(0, 1)
+-        )
++        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+         if k is not None:
+-            k = (
+-                k.contiguous()
+-                .view(-1, bsz * self.num_heads, self.head_dim)
+-                .transpose(0, 1)
+-            )
++            k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+         if v is not None:
+-            v = (
+-                v.contiguous()
+-                .view(-1, bsz * self.num_heads, self.head_dim)
+-                .transpose(0, 1)
+-            )
++            v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+ 
+         if saved_state is not None:
+             # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
+@@ -316,16 +294,12 @@ class MultiheadAttention(nn.Module):
+             k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
+             v = torch.cat([v, v.new_zeros((v.size(0), 1) + v.size()[2:])], dim=1)
+             if attn_mask is not None:
+-                attn_mask = torch.cat(
+-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
+-                )
++                attn_mask = torch.cat([attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1)
+             if key_padding_mask is not None:
+                 key_padding_mask = torch.cat(
+                     [
+                         key_padding_mask,
+-                        torch.zeros(key_padding_mask.size(0), 1).type_as(
+-                            key_padding_mask
+-                        ),
++                        torch.zeros(key_padding_mask.size(0), 1).type_as(key_padding_mask),
+                     ],
+                     dim=1,
+                 )
+@@ -346,8 +320,7 @@ class MultiheadAttention(nn.Module):
+             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+             if not is_tpu:
+                 attn_weights = attn_weights.masked_fill(
+-                    key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
+-                    float("-inf"),
++                    key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"),
+                 )
+             else:
+                 attn_weights = attn_weights.transpose(0, 2)
+@@ -358,9 +331,7 @@ class MultiheadAttention(nn.Module):
+         if before_softmax:
+             return attn_weights, v
+ 
+-        attn_weights_float = utils.softmax(
+-            attn_weights, dim=-1, onnx_trace=self.onnx_trace
+-        )
++        attn_weights_float = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+         attn_weights = attn_weights_float.type_as(attn_weights)
+         attn_probs = self.dropout_module(attn_weights)
+ 
+@@ -376,9 +347,9 @@ class MultiheadAttention(nn.Module):
+         attn = self.out_proj(attn)
+         attn_weights: Optional[Tensor] = None
+         if need_weights:
+-            attn_weights = attn_weights_float.view(
+-                bsz, self.num_heads, tgt_len, src_len
+-            ).transpose(1, 0)
++            attn_weights = attn_weights_float.view(bsz, self.num_heads, tgt_len, src_len).transpose(
++                1, 0
++            )
+             if not need_head_weights:
+                 # average attention weights over heads
+                 attn_weights = attn_weights.mean(dim=0)
+@@ -404,30 +375,32 @@ class MultiheadAttention(nn.Module):
+         # leaves the frame, there will be a time when prev or current
+         # is None
+         elif prev_key_padding_mask is not None:
+-            filler = torch.zeros(
+-                (batch_size, src_len - prev_key_padding_mask.size(1)),
+-                device=prev_key_padding_mask.device,
+-            )
+-            new_key_padding_mask = torch.cat(
+-                [prev_key_padding_mask.float(), filler.float()], dim=1
+-            )
++            if src_len > prev_key_padding_mask.size(1):
++                filler = torch.zeros(
++                    (batch_size, src_len - prev_key_padding_mask.size(1)),
++                    device=prev_key_padding_mask.device,
++                )
++                new_key_padding_mask = torch.cat(
++                    [prev_key_padding_mask.float(), filler.float()], dim=1
++                )
++            else:
++                new_key_padding_mask = prev_key_padding_mask.float()
+         elif key_padding_mask is not None:
+-            filler = torch.zeros(
+-                (batch_size, src_len - key_padding_mask.size(1)),
+-                device=key_padding_mask.device,
+-            )
+-            new_key_padding_mask = torch.cat(
+-                [filler.float(), key_padding_mask.float()], dim=1
+-            )
++            if src_len > key_padding_mask.size(1):
++                filler = torch.zeros(
++                    (batch_size, src_len - key_padding_mask.size(1)),
++                    device=key_padding_mask.device,
++                )
++                new_key_padding_mask = torch.cat([filler.float(), key_padding_mask.float()], dim=1)
++            else:
++                new_key_padding_mask = key_padding_mask.float()
+         else:
+             new_key_padding_mask = prev_key_padding_mask
+         return new_key_padding_mask
+ 
+     @torch.jit.export
+     def reorder_incremental_state(
+-        self,
+-        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+-        new_order: Tensor,
++        self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], new_order: Tensor,
+     ):
+         """Reorder buffered internal state (for incremental generation)."""
+         input_buffer = self._get_input_buffer(incremental_state)
+@@ -435,9 +408,9 @@ class MultiheadAttention(nn.Module):
+             for k in input_buffer.keys():
+                 input_buffer_k = input_buffer[k]
+                 if input_buffer_k is not None:
+-                    if self.encoder_decoder_attention and input_buffer_k.size(
++                    if self.encoder_decoder_attention and input_buffer_k.size(0) == new_order.size(
+                         0
+-                    ) == new_order.size(0):
++                    ):
+                         break
+                     input_buffer[k] = input_buffer_k.index_select(0, new_order)
+             incremental_state = self._set_input_buffer(incremental_state, input_buffer)
+@@ -481,9 +454,7 @@ class MultiheadAttention(nn.Module):
+                 if k_bias in state_dict.keys():
+                     dim = int(state_dict[k].shape[0] / 3)
+                     items_to_add[prefix + "q_proj.bias"] = state_dict[k_bias][:dim]
+-                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][
+-                        dim : 2 * dim
+-                    ]
++                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][dim : 2 * dim]
+                     items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim :]
+ 
+                     keys_to_remove.append(prefix + "in_proj_bias")
+diff --git a/fairseq/options.py b/fairseq/options.py
+index 7558264f..bdaf005d 100644
+--- a/fairseq/options.py
++++ b/fairseq/options.py
+@@ -286,6 +286,8 @@ def add_preprocess_args(parser):
+                        help="Pad dictionary size to be multiple of N")
+     group.add_argument("--workers", metavar="N", default=1, type=int,
+                        help="number of parallel workers")
++    group.add_argument("--molecule", action="store_true",
++                       help="Process Graph data into PyG format")
+     # fmt: on
+     return parser
+ 
+diff --git a/fairseq/utils.py b/fairseq/utils.py
+index 03826d18..ad5f4d60 100644
+--- a/fairseq/utils.py
++++ b/fairseq/utils.py
+@@ -19,6 +19,7 @@ import torch
+ import torch.nn.functional as F
+ from fairseq.modules.multihead_attention import MultiheadAttention
+ from torch import Tensor
++from torch_geometric.data import Data
+ 
+ 
+ try:
+@@ -92,6 +93,8 @@ def apply_to_sample(f, sample):
+             return tuple(_apply(x) for x in x)
+         elif isinstance(x, set):
+             return {_apply(x) for x in x}
++        elif isinstance(x, Data):
++            return x.apply(f)
+         else:
+             return x
+ 
+diff --git a/fairseq_cli/generate.py b/fairseq_cli/generate.py
+index 7bd582b2..1b5afcbe 100644
+--- a/fairseq_cli/generate.py
++++ b/fairseq_cli/generate.py
+@@ -38,11 +38,14 @@ def main(cfg: DictConfig):
+     ), "--replace-unk requires a raw text dataset (--dataset-impl=raw)"
+ 
+     if cfg.common_eval.results_path is not None:
+-        os.makedirs(cfg.common_eval.results_path, exist_ok=True)
+-        output_path = os.path.join(
+-            cfg.common_eval.results_path,
+-            "generate-{}.txt".format(cfg.dataset.gen_subset),
+-        )
++        if cfg.common_eval.results_path == "results":
++            output_path = "{}.generate-{}.txt".format(cfg.common_eval.path, cfg.dataset.gen_subset)
++        else:
++            os.makedirs(cfg.common_eval.results_path, exist_ok=True)
++            output_path = os.path.join(
++                cfg.common_eval.results_path,
++                "generate-{}.txt".format(cfg.dataset.gen_subset),
++            )
+         with open(output_path, "w", buffering=1, encoding="utf-8") as h:
+             return _main(cfg, h)
+     else:
+diff --git a/fairseq_cli/preprocess.py b/fairseq_cli/preprocess.py
+index fa77da8d..0b9565f2 100644
+--- a/fairseq_cli/preprocess.py
++++ b/fairseq_cli/preprocess.py
+@@ -17,7 +17,7 @@ from multiprocessing import Pool
+ 
+ from fairseq import options, tasks, utils
+ from fairseq.binarizer import Binarizer
+-from fairseq.data import indexed_dataset
++from fairseq.data import indexed_dataset, mol_indexed_dataset
+ 
+ 
+ logging.basicConfig(
+@@ -183,6 +183,56 @@ def main(args):
+             )
+         )
+ 
++    def make_binary_molecule_dataset(input_prefix, output_prefix, lang, num_workers):
++        logger.info("Convert {} SMILES into PyG format.".format(input_prefix))
++        n_graph_node = [0, 0]
++
++        def merge_result(worker_result):
++            n_graph_node[0] += worker_result["ngraph"]
++            n_graph_node[1] += worker_result["nnode"]
++
++        input_file = "{}{}".format(input_prefix, ".{}".format(lang) if lang is not None else "")
++        offsets = Binarizer.find_offsets(input_file, num_workers)
++        pool = None
++        if num_workers > 1:
++            pool = Pool(processes=num_workers - 1)
++            for worker_id in range(1, num_workers):
++                prefix = "{}{}".format(output_prefix, worker_id)
++                pool.apply_async(
++                    binarize_molecule,
++                    (
++                        args,
++                        input_file,
++                        prefix,
++                        lang,
++                        offsets[worker_id],
++                        offsets[worker_id + 1],
++                    ),
++                    callback=merge_result,
++                )
++            pool.close()
++
++        ds = mol_indexed_dataset.make_builder(
++            dataset_dest_file(args, output_prefix, lang, 'bin'),
++            impl=args.dataset_impl,
++            vocab_size=None
++        )
++        merge_result(Binarizer.binarize_molecule(input_file, consumer=lambda t: ds.add_item(t),
++                                                 offset=0, end=offsets[1]))
++        if num_workers > 1:
++            pool.join()
++            for worker_id in range(1, num_workers):
++                prefix = "{}{}".format(output_prefix, worker_id)
++                temp_file_path = dataset_dest_prefix(args, prefix, lang)
++                ds.merge_file_(temp_file_path)
++                ds.remove_temp_files(temp_file_path)
++
++        ds.finalize(dataset_dest_file(args, output_prefix, lang, "idx"))
++        logger.info(
++            "[{}] {}: {} graphs, {} nodes.".format(lang, input_file,
++                                                   n_graph_node[0], n_graph_node[1])
++        )
++
+     def make_binary_alignment_dataset(input_prefix, output_prefix, num_workers):
+         nseq = [0]
+ 
+@@ -246,6 +296,8 @@ def main(args):
+             shutil.copyfile(file_name(input_prefix, lang), output_text_file)
+         else:
+             make_binary_dataset(vocab, input_prefix, output_prefix, lang, num_workers)
++            if args.molecule:
++                make_binary_molecule_dataset(input_prefix, output_prefix, lang, num_workers)
+ 
+     def make_all(lang, vocab):
+         if args.trainpref:
+@@ -350,6 +402,22 @@ def binarize(args, filename, vocab, output_prefix, lang, offset, end, append_eos
+     return res
+ 
+ 
++def binarize_molecule(args, filename, output_prefix, lang, offset, end):
++    ds = mol_indexed_dataset.make_builder(
++        dataset_dest_file(args, output_prefix, lang, 'bin'),
++        impl=args.dataset_impl,
++        vocab_size=None
++    )
++
++    def consumer(graph):
++        ds.add_item(graph)
++
++    res = Binarizer.binarize_molecule(filename, consumer=consumer,
++                                      offset=offset, end=end)
++    ds.finalize(dataset_dest_file(args, output_prefix, lang, "idx"))
++    return res
++
++
+ def binarize_alignments(args, filename, parse_alignment, output_prefix, offset, end):
+     ds = indexed_dataset.make_builder(
+         dataset_dest_file(args, output_prefix, None, "bin"),
