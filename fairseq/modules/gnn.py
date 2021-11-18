@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from fairseq.modules.layer_norm import LayerNorm
 from fairseq import utils
 import torch

@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from fairseq.data.molecule.graphseq_pair_dataset import MaskGraphDataset
 from fairseq.data.lru_cache_dataset import LRUCacheDataset
 from fairseq.data.mask_tokens_dataset import MaskTokensDataset

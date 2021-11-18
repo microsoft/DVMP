@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from fairseq.tasks.onemodel import OneModel
 import math
 from dataclasses import dataclass, field

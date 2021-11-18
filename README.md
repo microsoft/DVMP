@@ -23,6 +23,8 @@ git apply dvmp.patch
 
 cd $pwd
 cp -r /tmp/fairseq/* ./
+
+pip install -e . 
 ```
 # Getting Started
 ## Pre-training

@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from .features import atom_to_feature_vector, bond_to_feature_vector
 from rdkit import Chem
 import numpy as np

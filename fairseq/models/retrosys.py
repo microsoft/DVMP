@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from argparse import ArgumentParser, ArgumentTypeError, ArgumentError, Namespace
 from dataclasses import dataclass, _MISSING_TYPE, MISSING
 from enum import Enum

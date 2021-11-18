@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from dataclasses import dataclass, field
 from fairseq.dataclass import FairseqDataclass
 from fairseq.criterions import FairseqCriterion, register_criterion

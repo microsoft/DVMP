@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 from fairseq.models.fairseq_model import FairseqLanguageModel
 import logging
 from dataclasses import dataclass, field
